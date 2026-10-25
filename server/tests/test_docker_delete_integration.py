@@ -222,7 +222,10 @@ def test_missing_application_still_allows_sidecar_cleanup(sandbox_pair, retry_by
         return original_remove(container, **kwargs)
 
     with patch.object(client.api, "remove_container", side_effect=fail_sidecar_remove):
-        service.delete_sandbox(sandbox_id)
+        with pytest.raises(HTTPException) as error:
+            service.delete_sandbox(sandbox_id)
+        assert error.value.status_code == 500
+        assert sandbox_id in service._expiration_timers
     sidecar.reload()
     assert sidecar.status == "exited"
     if retry_by == "delete":

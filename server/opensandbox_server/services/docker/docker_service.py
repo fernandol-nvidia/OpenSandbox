@@ -308,6 +308,18 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
             self._expiration_timers[sandbox_id] = timer
         timer.start()
 
+    def _schedule_cleanup_retry(self, sandbox_id: str, **cleanup_context) -> None:
+        # A repeated DELETE may find no application. Keep the ownership context
+        # retained by the first failed cleanup instead of replacing it with none.
+        with self._expiration_lock:
+            previous = self._expiration_timers.get(sandbox_id)
+            pending = dict(previous.kwargs or {}) if previous is not None else {}
+        pending.update({key: value for key, value in cleanup_context.items() if value is not None})
+        self._schedule_expiration(
+            sandbox_id, datetime.now(timezone.utc) + timedelta(seconds=30),
+            update_expiration=False, **pending,
+        )
+
     def _remove_expiration_tracking(self, sandbox_id: str) -> None:
         with self._expiration_lock:
             timer = self._expiration_timers.pop(sandbox_id, None)
@@ -340,6 +352,7 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
         self,
         sandbox_id: str,
         fallback_mount_keys: Optional[list[str]] = None,
+        fallback_managed_volumes: Optional[list[str]] = None,
     ) -> None:
         """Timer callback to terminate expired sandboxes."""
         mount_keys: list[str] = []
@@ -347,7 +360,14 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
             container = self._get_container_by_sandbox_id(sandbox_id)
         except HTTPException as exc:
             if exc.status_code == status.HTTP_404_NOT_FOUND:
-                self._cleanup_egress_sidecar(sandbox_id)
+                egress_clean = self._cleanup_egress_sidecar(sandbox_id)
+                volumes_clean = self._cleanup_managed_volumes(sandbox_id, fallback_managed_volumes or [])
+                if not egress_clean or not volumes_clean:
+                    self._schedule_cleanup_retry(
+                        sandbox_id, fallback_mount_keys=fallback_mount_keys,
+                        fallback_managed_volumes=fallback_managed_volumes,
+                    )
+                    return
                 self._remove_expiration_tracking(sandbox_id)
                 self._cleanup_windows_oem_volume(sandbox_id, None)
                 if fallback_mount_keys:
@@ -418,12 +438,16 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
         except (TypeError, json.JSONDecodeError):
             managed_volumes = []
 
+        egress_clean = self._cleanup_egress_sidecar(sandbox_id)
+        volumes_clean = self._cleanup_managed_volumes(sandbox_id, managed_volumes)
+        if not egress_clean or not volumes_clean:
+            self._schedule_cleanup_retry(
+                sandbox_id, fallback_mount_keys=mount_keys, fallback_managed_volumes=managed_volumes,
+            )
+            return
         self._remove_expiration_tracking(sandbox_id)
-        # Ensure sidecar is also cleaned up on expiration
-        self._cleanup_egress_sidecar(sandbox_id)
         self._cleanup_windows_oem_volume(sandbox_id, labels)
         self._release_ossfs_mounts(mount_keys)
-        self._cleanup_managed_volumes(sandbox_id, managed_volumes)
         self._metadata_store.delete(sandbox_id)
 
     def _restore_existing_sandboxes(self) -> None:
@@ -506,7 +530,8 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
                 self._get_container_by_sandbox_id(orphan_id)
             except HTTPException as exc:
                 if exc.status_code == status.HTTP_404_NOT_FOUND:
-                    self._cleanup_egress_sidecar(orphan_id)
+                    if not self._cleanup_egress_sidecar(orphan_id):
+                        self._schedule_cleanup_retry(orphan_id)
                 else:
                     logger.warning(
                         f"Failed to check sandbox {orphan_id} for orphan sidecar cleanup: {exc}"
@@ -975,13 +1000,10 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
                     unconfine_system_paths=isolation_requested,
                 )
         except Exception:
-            if sidecar_container is not None:
-                try:
-                    sidecar_container.remove(force=True)
-                except DockerException as cleanup_exc:
-                    logger.warning(
-                        f"Failed to cleanup egress sidecar for sandbox {sandbox_id}: {cleanup_exc}"
-                    )
+            # Startup can fail after Docker allocated a sidecar but before the
+            # helper returns its handle. Reconcile by the server-owned label.
+            if request.network_policy and not self._cleanup_egress_sidecar(sandbox_id):
+                self._schedule_cleanup_retry(sandbox_id)
             self._release_ossfs_mounts(ossfs_mount_keys)
             self._cleanup_managed_volumes(sandbox_id, auto_created_volumes or [])
             raise
@@ -1099,7 +1121,28 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
             container = self._get_container_by_sandbox_id(sandbox_id)
         except HTTPException as exc:
             if exc.status_code == status.HTTP_404_NOT_FOUND:
-                self._cleanup_egress_sidecar(sandbox_id)
+                if not self._cleanup_egress_sidecar(sandbox_id):
+                    self._schedule_cleanup_retry(sandbox_id)
+                    raise HTTPException(
+                        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                        detail={"code": SandboxErrorCodes.SANDBOX_DELETE_FAILED,
+                                "message": "Sandbox egress cleanup is incomplete; cleanup will retry."},
+                    ) from exc
+                # Complete any ownership context retained by a prior DELETE.
+                with self._expiration_lock:
+                    timer = self._expiration_timers.get(sandbox_id)
+                    pending = dict(timer.kwargs or {}) if timer is not None else {}
+                if not self._cleanup_managed_volumes(sandbox_id, pending.get("fallback_managed_volumes") or []):
+                    self._schedule_cleanup_retry(sandbox_id)
+                    raise HTTPException(
+                        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                        detail={"code": SandboxErrorCodes.SANDBOX_DELETE_FAILED,
+                                "message": "Sandbox volume cleanup is incomplete; cleanup will retry."},
+                    ) from exc
+                self._remove_expiration_tracking(sandbox_id)
+                self._release_ossfs_mounts(pending.get("fallback_mount_keys") or [])
+                self._cleanup_windows_oem_volume(sandbox_id, None)
+                self._metadata_store.delete(sandbox_id)
             raise
         labels = container.attrs.get("Config", {}).get("Labels") or {}
         mount_keys_raw = labels.get(SANDBOX_OSSFS_MOUNTS_LABEL, "[]")
@@ -1130,11 +1173,20 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
                     "message": f"Failed to delete sandbox container: {str(exc)}",
                 },
             ) from exc
+        egress_clean = self._cleanup_egress_sidecar(sandbox_id)
+        volumes_clean = self._cleanup_managed_volumes(sandbox_id, managed_volumes)
+        if not egress_clean or not volumes_clean:
+            self._schedule_cleanup_retry(
+                sandbox_id, fallback_mount_keys=mount_keys, fallback_managed_volumes=managed_volumes,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail={"code": SandboxErrorCodes.SANDBOX_DELETE_FAILED,
+                        "message": "Sandbox cleanup is incomplete; cleanup will retry."},
+            )
         self._remove_expiration_tracking(sandbox_id)
-        self._cleanup_egress_sidecar(sandbox_id)
         self._cleanup_windows_oem_volume(sandbox_id, labels)
         self._release_ossfs_mounts(mount_keys)
-        self._cleanup_managed_volumes(sandbox_id, managed_volumes)
         self._metadata_store.delete(sandbox_id)
 
     def pause_sandbox(self, sandbox_id: str) -> None:

@@ -28,6 +28,7 @@ from typing import Optional
 
 from docker.errors import DockerException, NotFound as DockerNotFound
 from fastapi import HTTPException, status
+from requests.exceptions import RequestException
 
 from opensandbox_server.services.constants import (
     SANDBOX_MANAGED_VOLUMES_LABEL,
@@ -424,14 +425,15 @@ class DockerVolumesMixin:
                 f"volume {volume_name}: {exc}"
             )
 
-    def _cleanup_managed_volumes(self, sandbox_id: str, volume_names: list[str]) -> None:
+    def _cleanup_managed_volumes(self, sandbox_id: str, volume_names: list[str]) -> bool:
         """
         Remove Docker named volumes that were auto-created for this sandbox.
 
         Only volumes whose ``opensandbox.io/volume-managed-by`` label equals
         ``"server"`` are removed.  Pre-existing volumes are never touched.
-        Errors are logged but do not propagate — volume cleanup is best-effort.
+        Errors are logged and reported as False so lifecycle owners can retry cleanup.
         """
+        completed = True
         for name in volume_names:
             try:
                 vol_info = self.docker_client.api.inspect_volume(name)
@@ -448,7 +450,9 @@ class DockerVolumesMixin:
                 logger.debug(
                     f"sandbox={sandbox_id} | managed volume '{name}' already removed"
                 )
-            except DockerException as exc:
+            except (DockerException, RequestException) as exc:
+                completed = False
                 logger.warning(
                     f"sandbox={sandbox_id} | failed to remove managed volume '{name}': {exc}"
                 )
+        return completed

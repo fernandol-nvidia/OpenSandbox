@@ -41,6 +41,8 @@ A sandbox is observed as `Pending` or `Running`, moves through the `Pausing` / `
 
 For Kubernetes BatchSandbox workloads, `DELETE /sandboxes/{id}` returns `204` and SDK `kill()` returns when deletion is accepted. Poll `GET /sandboxes/{id}`: it reports `Stopping` while cleanup finishes, then returns `404`. Under normal managed deletion, non-pooled sandboxes and pools using the default `Delete` strategy wait for pods to disappear; pool `Noop` preserves processes, so its `404` does not confirm runtime termination.
 
+Docker creation failures preserve the original error while cleaning up any labeled egress sidecar, including one whose startup failed before returning a handle. If Docker cannot confirm removal, the existing expiration timer retries cleanup after 30 seconds. Runtime-volume removal follows sidecar removal; this recovery does not retry the sandbox creation or weaken its network policy. Docker DELETE reports `500 SANDBOX_DELETE_FAILED` while owned sidecar or managed-volume cleanup remains incomplete, even if the application container has already disappeared. DELETE and TTL retain cleanup ownership for the existing timer to retry; repeated DELETE returns `404` only after that cleanup succeeds. Startup also schedules retries for orphan sidecars whose removal fails.
+
 ### Endpoint resolution is part of the contract
 
 Clients never guess how to reach a sandbox service. `GET /sandboxes/{id}/endpoints/{port}` returns a reachable address in one of three forms, chosen by runtime and deployment topology: a direct address (Docker host mapping or pod IP), an ingress gateway route, or a server-proxied URL for deployments where neither direct nor gateway paths exist. The proxy is the compatibility fallback, not the fast path.

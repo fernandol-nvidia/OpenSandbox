@@ -24,6 +24,7 @@ from docker.errors import DockerException, NotFound as DockerNotFound
 import pytest
 from fastapi import HTTPException, status
 from pydantic import SecretStr, ValidationError
+from requests.exceptions import ReadTimeout
 
 from opensandbox_server.config import (
     AppConfig,
@@ -5647,4 +5648,150 @@ def test_delete_preserves_dependencies_until_application_removal(tmp_path, faile
         service.delete_sandbox(sandbox_id)
         assert operations == ["kill app", "remove app", "stop sidecar", "remove sidecar"]
         sidecar.stop.assert_called_once_with(timeout=9)
+        assert service._metadata_store.get_expiration(sandbox_id) is None
+
+
+@pytest.mark.asyncio
+@patch("opensandbox_server.services.docker.docker_service.docker")
+async def test_failed_create_reconciles_sidecar_without_returned_handle(mock_docker):
+    mock_client = MagicMock()
+    mock_client.containers.list.return_value = []
+    mock_docker.from_env.return_value = mock_client
+    cfg = _app_config()
+    cfg.docker.network_mode = "bridge"
+    cfg.egress = EgressConfig(image="egress:test")
+    service = DockerSandboxService(config=cfg)
+    original = HTTPException(status_code=500, detail="egress readiness failed")
+    request = CreateSandboxRequest(
+        image=ImageSpec(uri="actor:test"), timeout=120,
+        resourceLimits=ResourceLimits(root={}), entrypoint=["sleep", "600"],
+        networkPolicy=NetworkPolicy(default_action="deny", egress=[]),
+    )
+    with (
+        patch.object(service, "_ensure_image_available"),
+        patch.object(service, "_start_egress_sidecar", side_effect=original) as start,
+        patch.object(service, "_cleanup_egress_sidecar", return_value=False) as cleanup,
+        patch.object(service, "_schedule_expiration") as schedule,
+        patch.object(service, "_cleanup_managed_volumes"),
+    ):
+        with pytest.raises(HTTPException) as caught:
+            await service.create_sandbox(request)
+    assert caught.value is original
+    sandbox_id = start.call_args.kwargs["sandbox_id"]
+    cleanup.assert_called_once_with(sandbox_id)
+    assert schedule.call_args.args[0] == sandbox_id
+
+
+@pytest.mark.parametrize("failure", ["list", "remove", "volume"])
+def test_orphan_cleanup_retries_until_sidecar_and_owned_volume_are_absent(failure):
+    service = DockerSandboxService(config=_app_config())
+    sidecar = MagicMock()
+    sidecar.id = "orphan"
+    sidecar.remove.side_effect = [ReadTimeout("remove timed out"), None] if failure == "remove" else None
+    service.docker_client.api.inspect_volume.return_value = {
+        "Labels": {SANDBOX_MANAGED_VOLUMES_LABEL: "server"}
+    }
+    service.docker_client.api.remove_volume.side_effect = (
+        [ReadTimeout("volume removal timed out"), None] if failure == "volume" else None
+    )
+    attempts = [ReadTimeout("list timed out"), [sidecar]] if failure == "list" else [[sidecar], [sidecar]]
+    with (
+        patch.object(service.docker_client.containers, "list", side_effect=attempts),
+        patch.object(service, "_get_container_by_sandbox_id", side_effect=HTTPException(status_code=404)),
+        patch.object(service, "_cleanup_windows_oem_volume"),
+        patch.object(service, "_schedule_expiration") as schedule,
+        patch.object(service, "_remove_expiration_tracking") as forget,
+    ):
+        service._expire_sandbox("failed-create")
+        schedule.assert_called_once()
+        forget.assert_not_called()
+        service._expire_sandbox("failed-create")
+        forget.assert_called_once_with("failed-create")
+    service.docker_client.api.remove_volume.assert_called_with("opensandbox-runtime-failed-create")
+    sidecar.remove.assert_called_with(force=True)
+
+
+@patch("opensandbox_server.services.docker.docker_service.docker")
+def test_failed_sidecar_cleanup_preserves_readiness_error_on_transport_timeout(mock_docker):
+    client = MagicMock()
+    client.containers.list.return_value = []
+    client.api.create_container.return_value = {"Id": "sidecar"}
+    sidecar = client.containers.get.return_value
+    sidecar.remove.side_effect = ReadTimeout("cleanup timed out")
+    mock_docker.from_env.return_value = client
+    cfg = _app_config()
+    cfg.docker.network_mode = "bridge"
+    cfg.egress = EgressConfig(image="egress:test")
+    service = DockerSandboxService(config=cfg)
+    original = HTTPException(status_code=500, detail="egress readiness failed")
+    with (
+        patch.object(service, "_ensure_image_available"),
+        patch.object(service, "_wait_for_egress_sidecar_ready", side_effect=original),
+    ):
+        with pytest.raises(HTTPException) as caught:
+            service._start_egress_sidecar(
+                "failed-create", NetworkPolicy(default_action="deny", egress=[]),
+                egress_token="test", host_execd_port=44772, host_http_port=8080,
+                egress_api_host_port=18080,
+            )
+    assert caught.value is original
+
+
+@pytest.mark.parametrize("operation", ["delete", "ttl"])
+@pytest.mark.parametrize("retry_by", ["delete", "ttl"])
+@pytest.mark.parametrize("failure", ["egress", "volume"])
+def test_partial_cleanup_keeps_ownership_until_reconciled(tmp_path, operation, retry_by, failure):
+    client = MagicMock()
+    client.containers.list.return_value = []
+    with patch("docker.from_env", return_value=client):
+        service = DockerSandboxService(config=_app_config())
+    service._metadata_store = DockerMetadataStore(tmp_path / "metadata")
+    sandbox_id = "partial-cleanup"
+    expiration = datetime.now(timezone.utc) - timedelta(seconds=1)
+    service._metadata_store.set_expiration(sandbox_id, expiration)
+    application = MagicMock()
+    application.attrs = {"Config": {"Labels": {
+        SANDBOX_ID_LABEL: sandbox_id,
+        SANDBOX_OSSFS_MOUNTS_LABEL: '["owned-mount"]',
+        SANDBOX_MANAGED_VOLUMES_LABEL: '["owned-volume"]',
+    }}}
+    attempt = 0
+
+    def find(_):
+        if attempt == 0:
+            return application
+        raise HTTPException(status_code=404)
+
+    with (
+        patch.object(service, "_get_container_by_sandbox_id", side_effect=find),
+        patch.object(service, "_cleanup_egress_sidecar", side_effect=lambda _: failure != "egress" or attempt == 2),
+        patch.object(service, "_cleanup_managed_volumes", side_effect=lambda *_: failure != "volume" or attempt == 2) as volumes,
+        patch.object(service, "_release_ossfs_mounts") as release,
+        patch.object(service, "_cleanup_windows_oem_volume"),
+        patch("threading.Timer.start"),
+    ):
+        for attempt in range(3):
+            selected = operation if attempt == 0 else retry_by
+            if selected == "delete":
+                with pytest.raises(HTTPException) as error:
+                    service.delete_sandbox(sandbox_id)
+                assert error.value.status_code == (404 if attempt == 2 else 500)
+                if attempt < 2:
+                    assert error.value.detail["code"] == SandboxErrorCodes.SANDBOX_DELETE_FAILED
+            elif attempt == 0:
+                service._expire_sandbox(sandbox_id)
+            else:
+                timer = service._expiration_timers[sandbox_id]
+                timer.function(*timer.args, **timer.kwargs)
+            if attempt < 2:
+                assert service._metadata_store.get_expiration(sandbox_id) == expiration.isoformat()
+                assert service._expiration_timers[sandbox_id].kwargs == {
+                    "fallback_mount_keys": ["owned-mount"],
+                    "fallback_managed_volumes": ["owned-volume"],
+                }
+                release.assert_not_called()
+        application.remove.assert_called_once_with(force=True)
+        volumes.assert_called_with(sandbox_id, ["owned-volume"])
+        release.assert_called_once_with(["owned-mount"])
+        assert sandbox_id not in service._expiration_timers
         assert service._metadata_store.get_expiration(sandbox_id) is None

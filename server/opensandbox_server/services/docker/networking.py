@@ -458,18 +458,19 @@ class DockerNetworkingMixin:
     # Common helpers for creation
     # ---------------------------
 
-    def _cleanup_egress_sidecar(self, sandbox_id: str) -> None:
+    def _cleanup_egress_sidecar(self, sandbox_id: str) -> bool:
         """
-        Remove egress sidecar associated with sandbox_id (best effort).
+        Remove owned sidecars; report whether cleanup completed.
         """
         try:
             containers = self.docker_client.containers.list(
                 all=True, filters={"label": f"{EGRESS_SIDECAR_LABEL}={sandbox_id}"}
             )
-        except DockerException as exc:
+        except (DockerException, RequestException) as exc:
             logger.warning(f"sandbox={sandbox_id} | failed to list egress sidecar: {exc}")
-            return
+            return False
 
+        completed = True
         for container in containers:
             try:
                 with self._docker_operation("cleanup egress sidecar", sandbox_id):
@@ -484,13 +485,17 @@ class DockerNetworkingMixin:
             except DockerNotFound:
                 continue
             except (DockerException, RequestException) as exc:
+                completed = False
                 logger.warning(
                     f"sandbox={sandbox_id} | failed to remove egress sidecar {container.id}: {exc}"
                 )
 
-        # The shared runtime volume can outlive a successfully removed app.
-        # Removal is best effort and still checks the server-managed label.
-        self._cleanup_managed_volumes(sandbox_id, [f"opensandbox-runtime-{sandbox_id}"])
+        if completed:
+            # A failed create may leave this volume without an app container.
+            completed = self._cleanup_managed_volumes(
+                sandbox_id, [f"opensandbox-runtime-{sandbox_id}"]
+            )
+        return completed
 
     def _start_egress_sidecar(
         self,
@@ -649,7 +654,7 @@ class DockerNetworkingMixin:
                 try:
                     with self._docker_operation("cleanup egress sidecar", sandbox_id):
                         sidecar_container.remove(force=True)
-                except DockerException as cleanup_exc:
+                except (DockerException, RequestException) as cleanup_exc:
                     logger.warning(
                         f"Failed to cleanup egress sidecar for sandbox {sandbox_id}: {cleanup_exc}"
                     )
@@ -657,7 +662,7 @@ class DockerNetworkingMixin:
                 try:
                     with self._docker_operation("cleanup egress sidecar (API)", sandbox_id):
                         self.docker_client.api.remove_container(sidecar_container_id, force=True)
-                except DockerException as cleanup_exc:
+                except (DockerException, RequestException) as cleanup_exc:
                     logger.warning(
                         f"Failed to cleanup egress sidecar for sandbox {sandbox_id}: {cleanup_exc}"
                     )
